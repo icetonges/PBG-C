@@ -1,197 +1,232 @@
 /**
- * RURAL EXPLORER — app.js  v2.2
+ * RURAL EXPLORER — app.js  v2.3
  * ============================================================
- * Architecture : Static client-side decision-support dashboard.
- * Data source  : Excel (.xlsx) parsed with SheetJS (raw mode).
+ * v2.3 fixes (why the page was stuck on "INITIALIZING SYSTEM…"):
+ *   A. initMap() was NOT wrapped in try/catch.  If Leaflet threw
+ *      (container height 0, script load race, etc.) the entire
+ *      window.load handler died — loadExcelData() never ran and
+ *      the status LED stayed yellow forever.  Now isolated with
+ *      a 500 ms retry so a transient CSS-timing issue self-heals.
  *
- * BUG FIXES applied in this version:
- *   1. Column mapping — headers are read exactly as they appear
- *      in the spreadsheet ("Price", "Acres", "LLM Score", etc.).
- *      The old fuzzy-alias approach silently returned null for
- *      headers containing spaces or special characters like
- *      "Drive Dist (mi)" and "Property URL Link".
+ *   B. fetch() used a single hardcoded path ("data/list/…").
+ *      If the xlsx was placed anywhere else in the repo, the
+ *      request 404'd silently and the catch block never fired
+ *      visibly.  Now tries three common paths in sequence:
+ *        1. data/list/Feb012026.xlsx
+ *        2. data/Feb012026.xlsx
+ *        3. Feb012026.xlsx   (repo root)
  *
- *   2. URL extraction — the "Property URL Link" column stores
- *      unevaluated Excel HYPERLINK formulas, e.g.:
- *        =HYPERLINK("https://…","View Listing")
- *      SheetJS in default mode evaluates these and returns only
- *      the display text ("View Listing").  We now load the
- *      workbook with { raw: true } so formulas are preserved,
- *      then regex-extract the first quoted URL string.
+ *   C. No timeout existed.  A network hang or silent CORS block
+ *      on GitHub Pages left the yellow LED spinning forever.
+ *      A 15 s watchdog now flips the LED red with a clear message.
  *
- *   3. Map tiles — switched from CartoDB (which can block
- *      requests from GitHub Pages origins) to the standard
- *      OpenStreetMap tile server with correct attribution.
- *      Also ensured the map container has an explicit pixel
- *      height set in CSS so Leaflet can initialise its grid.
+ * Previous fixes (v2.2) retained:
+ *   1. Column headers matched exactly to the spreadsheet.
+ *   2. =HYPERLINK() formula strings parsed for real URLs.
+ *   3. OpenStreetMap tiles instead of CartoDB.
  * ============================================================
  */
 
 // ---------------------------------------------------------------------------
 // 1. GLOBAL STATE
 // ---------------------------------------------------------------------------
-let currentData   = [];          // Normalised property array
-let chartInstance  = null;        // Chart.js bubble chart handle
-let map, markers;                // Leaflet map + marker layer
+let currentData   = [];
+let chartInstance  = null;
+let map            = null;
+let markers        = null;
+let loadTimeout    = null;   // watchdog timer handle
 
 // ---------------------------------------------------------------------------
-// 2. MAP INITIALISATION
-//    Runs once on page load.  We use OpenStreetMap tiles which are
-//    permissively licensed and do not require an API key.
+// 2. MAP INITIALISATION  (isolated — cannot crash the data load)
 // ---------------------------------------------------------------------------
 function initMap() {
-    map = L.map('map', {
-        zoomControl: false,   // We add zoom at a custom position below
-        // Prevent the map from attempting to render before CSS has set the
-        // container height (avoids the "Map container is being initialized
-        // with a height of 0" warning).
-        preferCanvas: true
-    }).setView([38.8, -77.5], 8);
+    try {
+        map = L.map('map', { zoomControl: false, preferCanvas: true })
+               .setView([38.8, -77.5], 8);
 
-    // OpenStreetMap tile layer — works on any origin including GitHub Pages
-    L.tileLayer(
-        'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',
-        {
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
             maxZoom: 19,
             attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
-        }
-    ).addTo(map);
+        }).addTo(map);
 
-    // Zoom control moved to bottom-right to avoid overlapping the header
-    L.control.zoom({ position: 'bottomright' }).addTo(map);
+        L.control.zoom({ position: 'bottomright' }).addTo(map);
+        markers = L.featureGroup().addTo(map);
 
-    // Feature group gives us .getBounds() for auto-fitting
-    markers = L.featureGroup().addTo(map);
+        console.log('[RuralExplorer] Map initialised OK');
+    } catch (e) {
+        // Most common cause: container height is still 0 when Leaflet runs.
+        // Retry after 500 ms — by then CSS will have applied.
+        console.warn('[RuralExplorer] Map init failed, retrying in 500 ms —', e.message);
+        setTimeout(() => {
+            try {
+                map = L.map('map', { zoomControl: false, preferCanvas: true })
+                       .setView([38.8, -77.5], 8);
+                L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+                    maxZoom: 19,
+                    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+                }).addTo(map);
+                L.control.zoom({ position: 'bottomright' }).addTo(map);
+                markers = L.featureGroup().addTo(map);
+                console.log('[RuralExplorer] Map initialised on retry');
+            } catch (e2) {
+                console.error('[RuralExplorer] Map retry also failed —', e2.message);
+            }
+        }, 500);
+    }
 }
 
 // ---------------------------------------------------------------------------
 // 3. URL EXTRACTION FROM HYPERLINK FORMULAS
-//    Excel cells contain strings like:
-//      =HYPERLINK("https://www.google.com/search?q=…","View Listing")
-//    We extract the URL between the first pair of quotes after HYPERLINK(.
-//    If the string is already a plain URL or is missing, we fall back to '#'.
 // ---------------------------------------------------------------------------
 function extractURL(cellValue) {
     if (!cellValue || typeof cellValue !== 'string') return '#';
 
-    // Case A — raw HYPERLINK formula (what SheetJS gives us with raw:true)
+    // =HYPERLINK("https://…","View Listing")  →  extract the URL
     const match = cellValue.match(/=HYPERLINK\(\s*"([^"]+)"/i);
     if (match && match[1]) return match[1];
 
-    // Case B — already a plain URL
+    // Already a plain URL
     if (cellValue.startsWith('http://') || cellValue.startsWith('https://')) return cellValue;
 
-    // Case C — unrecognised format; return hash so the link is at least safe
     return '#';
 }
 
 // ---------------------------------------------------------------------------
-// 4. EXCEL LOADING & PARSING
-//    Key detail: we pass { raw: true } to XLSX.read() so that formula cells
-//    are NOT evaluated.  This preserves the =HYPERLINK(...) strings that
-//    contain our actual URLs.  Without this flag SheetJS returns only the
-//    display text ("View Listing") and the URLs are lost.
+// 4. MULTI-PATH FETCH HELPER
+//    Tries several candidate paths and returns the first successful Response.
+//    This way the app works whether the xlsx is in data/list/, data/, or root.
+// ---------------------------------------------------------------------------
+async function fetchFromMultiplePaths(fileName) {
+    const candidates = [
+        `data/list/${fileName}.xlsx`,   // original expected path
+        `data/${fileName}.xlsx`,        // flat data folder
+        `${fileName}.xlsx`              // repo root
+    ];
+
+    for (const path of candidates) {
+        console.log('[RuralExplorer] Trying path:', path);
+        try {
+            const res = await fetch(path);
+            if (res.ok) {
+                console.log('[RuralExplorer] Found file at:', path);
+                return { response: res, path: path };
+            }
+            console.log('[RuralExplorer] Not found at', path, '— status', res.status);
+        } catch (networkErr) {
+            console.log('[RuralExplorer] Fetch error at', path, '—', networkErr.message);
+        }
+    }
+
+    // None worked
+    throw new Error(
+        `Excel file "${fileName}.xlsx" not found. Tried: ${candidates.join(', ')}. ` +
+        `Ensure the file is committed to your GitHub Pages repo at one of those paths.`
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 5. EXCEL LOADING & PARSING
 // ---------------------------------------------------------------------------
 async function loadExcelData(fileName) {
     const status    = document.getElementById('statusUpdate');
     const statusLed = document.getElementById('statusLed');
     const pathTrace = document.getElementById('pathTrace');
 
-    // The xlsx lives at the repo root in a "data/list/" folder.
-    // Adjust this path if your directory structure differs.
-    const fileRelPath = `data/list/${fileName}.xlsx`;
+    // --- Start the 15-second watchdog. If we haven't finished by then,
+    //     flip the LED red so the user knows something is wrong. ---
+    if (loadTimeout) clearTimeout(loadTimeout);
+    loadTimeout = setTimeout(() => {
+        statusLed.className = 'w-2.5 h-2.5 rounded-full bg-red-500 border border-white/20';
+        status.innerHTML = '<span style="color:#f87171;">TIMEOUT — loading stalled. Check browser console for details.</span>';
+        pathTrace.innerText = 'Watchdog triggered after 15 s';
+    }, 15000);
 
     try {
         // --- Status: loading ---
-        status.innerText  = `ACCESSING ${fileName}...`;
-        pathTrace.innerText = `Target: ${fileRelPath}`;
+        status.innerText    = `ACCESSING ${fileName}...`;
+        pathTrace.innerText = 'Searching…';
         statusLed.className = 'w-2.5 h-2.5 rounded-full bg-blue-500 animate-pulse border border-white/20';
 
-        // Fetch the Excel file
-        const response = await fetch(fileRelPath);
-        if (!response.ok) throw new Error(`HTTP ${response.status} — file not found at "${fileRelPath}"`);
+        // --- Find and fetch the file (multi-path) ---
+        const { response, path } = await fetchFromMultiplePaths(fileName);
+        pathTrace.innerText = `Loaded: ${path}`;
 
         const arrayBuffer = await response.arrayBuffer();
 
-        // *** CRITICAL: raw:true preserves formula strings ***
-        const workbook = XLSX.read(new Uint8Array(arrayBuffer), {
-            type:   'array',
-            raw:    true   // <— keeps =HYPERLINK() formulas intact
-        });
+        // *** raw:true keeps =HYPERLINK() formulas intact ***
+        const workbook = XLSX.read(new Uint8Array(arrayBuffer), { type: 'array', raw: true });
+        const sheet    = workbook.Sheets[workbook.SheetNames[0]];
+        const rawJson  = XLSX.utils.sheet_to_json(sheet, { raw: true });
 
-        const sheet  = workbook.Sheets[workbook.SheetNames[0]];
-
-        // sheet_to_json with raw:true returns formula strings as-is
-        const rawJson = XLSX.utils.sheet_to_json(sheet, { raw: true });
-
-        console.log('[RuralExplorer] Raw row count:', rawJson.length);
+        console.log('[RuralExplorer] Raw rows:', rawJson.length);
         if (rawJson.length > 0) {
-            console.log('[RuralExplorer] Detected columns:', Object.keys(rawJson[0]));
+            console.log('[RuralExplorer] Columns:', Object.keys(rawJson[0]));
         }
 
-        // --- Normalise rows using EXACT column headers from the spreadsheet ---
-        // Headers confirmed via inspection:
-        //   Address | City | State | Price | Acres | Type | Score | Notes |
-        //   Latitude | Longitude | Drive Dist (mi) | Drive Adv/Disadv |
-        //   LLM Score | Property URL Link
+        // --- Normalise using exact column headers from the spreadsheet ---
         currentData = rawJson.map((row, index) => {
-            const price      = parseFloat(row['Price'])             || 0;
-            const acres      = parseFloat(row['Acres'])             || 0;
-            const lat        = parseFloat(row['Latitude']);
-            const lng        = parseFloat(row['Longitude']);
-            const driveTime  = parseInt(row['Drive Dist (mi)'],10) || 0;
-            const llmScore   = parseInt(row['LLM Score'],10)       || 0;
-            const address    = (row['Address'] || 'Unnamed Property').toString().trim();
-            const city       = (row['City']    || '').toString().trim();
-            const state      = (row['State']  || '').toString().trim();
-            const type       = (row['Type']   || 'Land').toString().trim();
-            const url        = extractURL(row['Property URL Link']);
+            const price     = parseFloat(row['Price'])            || 0;
+            const acres     = parseFloat(row['Acres'])            || 0;
+            const lat       = parseFloat(row['Latitude']);
+            const lng       = parseFloat(row['Longitude']);
+            const driveTime = parseInt(row['Drive Dist (mi)'], 10) || 0;
+            const llmScore  = parseInt(row['LLM Score'], 10)      || 0;
+            const address   = (row['Address'] || 'Unnamed Property').toString().trim();
+            const city      = (row['City']    || '').toString().trim();
+            const state     = (row['State']  || '').toString().trim();
+            const type      = (row['Type']   || 'Land').toString().trim();
+            const url       = extractURL(row['Property URL Link']);
 
-            // Build a human-readable full address for cards / popups
-            const fullAddress = city && state
-                ? `${address}, ${city}, ${state}`
-                : address;
+            const fullAddress = city && state ? `${address}, ${city}, ${state}` : address;
 
             return { id: index, address: fullAddress, price, acres, llmScore, lat, lng, driveTime, url, type };
         }).filter(p => {
-            // Keep only rows that have a valid price AND valid coordinates
             const valid = p.price > 0 && !isNaN(p.lat) && !isNaN(p.lng);
-            if (!valid) console.warn('[RuralExplorer] Skipping row', p.id, '— invalid price or coords');
+            if (!valid) console.warn('[RuralExplorer] Skipping row', p.id);
             return valid;
         });
 
         console.log('[RuralExplorer] Usable properties:', currentData.length);
         console.log('[RuralExplorer] Sample URLs:', currentData.slice(0, 3).map(d => d.url));
 
+        // --- Cancel the watchdog — we finished in time ---
+        clearTimeout(loadTimeout);
+
         // --- Status: success ---
-        status.innerText  = `${fileName} LOADED — ${currentData.length} properties`;
+        status.innerText    = `${fileName} LOADED — ${currentData.length} properties`;
         statusLed.className = 'w-2.5 h-2.5 rounded-full bg-emerald-500 border border-white/20';
 
         renderUI();
 
     } catch (err) {
-        console.error('[RuralExplorer] Critical failure:', err);
-        status.innerHTML  = `<span style="color:#f87171;">LOAD FAILED: ${err.message}</span>`;
+        clearTimeout(loadTimeout);
+        console.error('[RuralExplorer] Load failed:', err);
+        status.innerHTML    = `<span style="color:#f87171;">LOAD FAILED: ${err.message}</span>`;
         statusLed.className = 'w-2.5 h-2.5 rounded-full bg-red-500 border border-white/20';
+        pathTrace.innerText = 'Error — see console';
     }
 }
 
 // ---------------------------------------------------------------------------
-// 5. RENDER ORCHESTRATOR
+// 6. RENDER ORCHESTRATOR
 // ---------------------------------------------------------------------------
 function renderUI() {
     renderListings();
     renderChart();
     renderAnalysis();
 
-    // Fit map viewport to all markers (with a little padding)
-    if (markers && markers.getLayers().length > 0) {
-        map.fitBounds(markers.getBounds().pad(0.15));
+    // Fit map to markers only if the map is live and has data
+    if (map && markers && markers.getLayers().length > 0) {
+        try {
+            map.fitBounds(markers.getBounds().pad(0.15));
+        } catch (e) {
+            console.warn('[RuralExplorer] fitBounds failed —', e.message);
+        }
     }
 }
 
 // ---------------------------------------------------------------------------
-// 6. LISTING CARDS + MAP MARKERS
+// 7. LISTING CARDS + MAP MARKERS
 // ---------------------------------------------------------------------------
 function renderListings() {
     const grid = document.getElementById('listingGrid');
@@ -199,11 +234,9 @@ function renderListings() {
     if (markers) markers.clearLayers();
 
     currentData.forEach(p => {
-        // --- Card DOM ---
         const card = document.createElement('div');
         card.className = 'bg-white p-5 rounded-2xl shadow-sm border border-gray-100 hover:border-emerald-500 transition-all cursor-pointer group property-card';
 
-        // Price per acre helper
         const pricePerAcre = p.acres > 0 ? Math.round(p.price / p.acres).toLocaleString() : '—';
 
         card.innerHTML = `
@@ -218,7 +251,6 @@ function renderListings() {
                 <div class="flex items-center gap-1 text-xs font-bold text-slate-600">🚗 ${p.driveTime} mi</div>
                 <div class="flex items-center gap-1 text-xs font-bold text-slate-500">$${pricePerAcre}/ac</div>
             </div>
-            <!-- Listing link — opens in a new tab. href is set from the extracted URL. -->
             <a href="${p.url}"
                target="_blank"
                rel="noopener noreferrer"
@@ -227,61 +259,51 @@ function renderListings() {
             >Explore Original Listing</a>
         `;
 
-        // Clicking the card (but not the link) flies the map to that pin
+        // Card click flies the map to that property (link click is isolated via stopPropagation)
         card.addEventListener('click', () => {
-            map.flyTo([p.lat, p.lng], 13);
+            if (map) map.flyTo([p.lat, p.lng], 13);
         });
 
         grid.appendChild(card);
 
-        // --- Map marker ---
-        // Green for high-scoring (>= 90), slate for the rest
-        const markerColor = p.llmScore >= 90 ? '#10b981' : '#64748b';
+        // --- Map marker (only if map is initialised) ---
+        if (markers) {
+            const markerColor = p.llmScore >= 90 ? '#10b981' : '#64748b';
 
-        const marker = L.circleMarker([p.lat, p.lng], {
-            radius:      9,
-            fillColor:   markerColor,
-            color:       '#ffffff',
-            weight:      2,
-            fillOpacity: 0.9
-        });
-
-        // Popup includes a clickable link to the listing
-        marker.bindPopup(
-            `<div style="min-width:140px; font-family:sans-serif;">
-                <b style="font-size:14px;">$${p.price.toLocaleString()}</b><br>
-                <span style="font-size:11px; color:#64748b;">${p.address}</span><br>
-                <span style="font-size:10px; color:#64748b;">${p.acres} ac &nbsp;|&nbsp; Score: ${p.llmScore}</span><br>
-                <a href="${p.url}" target="_blank" rel="noopener noreferrer"
-                   style="font-size:11px; color:#10b981; font-weight:bold; text-decoration:underline;">
-                    View Listing →
-                </a>
-            </div>`
-        );
-
-        if (markers) marker.addTo(markers);
+            L.circleMarker([p.lat, p.lng], {
+                radius: 9, fillColor: markerColor,
+                color: '#ffffff', weight: 2, fillOpacity: 0.9
+            })
+            .bindPopup(
+                `<div style="min-width:140px; font-family:sans-serif;">
+                    <b style="font-size:14px;">$${p.price.toLocaleString()}</b><br>
+                    <span style="font-size:11px; color:#64748b;">${p.address}</span><br>
+                    <span style="font-size:10px; color:#64748b;">${p.acres} ac &nbsp;|&nbsp; Score: ${p.llmScore}</span><br>
+                    <a href="${p.url}" target="_blank" rel="noopener noreferrer"
+                       style="font-size:11px; color:#10b981; font-weight:bold; text-decoration:underline;">
+                        View Listing →
+                    </a>
+                </div>`
+            )
+            .addTo(markers);
+        }
     });
 
-    // Update the heading with the property count
     document.getElementById('listingCount').innerText = `${currentData.length} Strategic Assets`;
 }
 
 // ---------------------------------------------------------------------------
-// 7. SIDEBAR ANALYSIS
+// 8. SIDEBAR ANALYSIS
 // ---------------------------------------------------------------------------
 function renderAnalysis() {
     if (currentData.length === 0) return;
 
-    // Averages
-    const totalPrice   = currentData.reduce((sum, p) => sum + p.price, 0);
-    const avgPrice     = totalPrice / currentData.length;
-    const totalPPA     = currentData.reduce((sum, p) => sum + (p.acres > 0 ? p.price / p.acres : 0), 0);
-    const avgPricePerAcre = totalPPA / currentData.length;
+    const avgPrice        = currentData.reduce((s, p) => s + p.price, 0) / currentData.length;
+    const avgPricePerAcre = currentData.reduce((s, p) => s + (p.acres > 0 ? p.price / p.acres : 0), 0) / currentData.length;
 
-    document.getElementById('avgPrice').innerText  = `$${Math.round(avgPrice).toLocaleString()}`;
-    document.getElementById('avgAcres').innerText  = `$${Math.round(avgPricePerAcre).toLocaleString()}/ac`;
+    document.getElementById('avgPrice').innerText = `$${Math.round(avgPrice).toLocaleString()}`;
+    document.getElementById('avgAcres').innerText = `$${Math.round(avgPricePerAcre).toLocaleString()}/ac`;
 
-    // Narrative — driven by the top-scoring property
     const sorted  = [...currentData].sort((a, b) => b.llmScore - a.llmScore);
     const topPick = sorted[0];
 
@@ -291,7 +313,6 @@ function renderAnalysis() {
         `Average density across this snapshot is $${Math.round(avgPricePerAcre).toLocaleString()}/acre ` +
         `over ${currentData.length} active listings.`;
 
-    // Top 3 picks list
     const picksContainer = document.getElementById('topPicks');
     picksContainer.innerHTML = '';
 
@@ -311,17 +332,11 @@ function renderAnalysis() {
 }
 
 // ---------------------------------------------------------------------------
-// 8. BUBBLE CHART
-//    X = drive distance (mi), Y = $/acre, Bubble radius ∝ LLM score
+// 9. BUBBLE CHART
 // ---------------------------------------------------------------------------
 function renderChart() {
     const ctx = document.getElementById('marketChart').getContext('2d');
-
-    // Destroy any previous instance to prevent memory leaks / flicker
-    if (chartInstance) {
-        chartInstance.destroy();
-        chartInstance = null;
-    }
+    if (chartInstance) { chartInstance.destroy(); chartInstance = null; }
 
     chartInstance = new Chart(ctx, {
         type: 'bubble',
@@ -331,7 +346,7 @@ function renderChart() {
                 data: currentData.map(p => ({
                     x: p.driveTime,
                     y: p.acres > 0 ? Math.round(p.price / p.acres) : 0,
-                    r: Math.max(4, p.llmScore / 8)   // scale bubble size; floor at 4px
+                    r: Math.max(4, p.llmScore / 8)
                 })),
                 backgroundColor:      'rgba(16, 185, 129, 0.55)',
                 borderColor:          'rgba(16, 185, 129, 0.9)',
@@ -340,43 +355,30 @@ function renderChart() {
             }]
         },
         options: {
-            responsive:        true,
+            responsive: true,
             maintainAspectRatio: false,
-            animation:         { duration: 400 },
+            animation: { duration: 400 },
             plugins: {
                 legend: { display: false },
                 tooltip: {
                     callbacks: {
                         label: function(context) {
-                            const idx  = context.dataIndex;
-                            const prop = currentData[idx];
-                            return prop
-                                ? `${prop.address} — $${prop.price.toLocaleString()} | ${prop.acres} ac`
-                                : '';
+                            const prop = currentData[context.dataIndex];
+                            return prop ? `${prop.address} — $${prop.price.toLocaleString()} | ${prop.acres} ac` : '';
                         }
                     }
                 }
             },
             scales: {
                 x: {
-                    title: {
-                        display: true,
-                        text:    'Drive Distance (mi)',
-                        font:    { size: 10, weight: 'bold' }
-                    },
+                    title: { display: true, text: 'Drive Distance (mi)', font: { size: 10, weight: 'bold' } },
                     ticks: { font: { size: 9 } }
                 },
                 y: {
-                    title: {
-                        display: true,
-                        text:    '$ / Acre',
-                        font:    { size: 10, weight: 'bold' }
-                    },
+                    title: { display: true, text: '$ / Acre', font: { size: 10, weight: 'bold' } },
                     ticks: {
                         font: { size: 9 },
-                        callback: function(value) {
-                            return '$' + value.toLocaleString();
-                        }
+                        callback: v => '$' + v.toLocaleString()
                     }
                 }
             }
@@ -385,16 +387,15 @@ function renderChart() {
 }
 
 // ---------------------------------------------------------------------------
-// 9. EVENT WIRING
+// 10. EVENT WIRING & BOOTSTRAP
 // ---------------------------------------------------------------------------
-
-// Snapshot selector triggers a fresh data load
 document.getElementById('fileSelector').addEventListener('change', function(e) {
     loadExcelData(e.target.value);
 });
 
-// Bootstrap on page load — initialise the map first, then load data
+// Bootstrap: map and data load are independent.
+// If initMap() throws, loadExcelData() still runs (and vice versa).
 window.addEventListener('load', function() {
-    initMap();
-    loadExcelData('Feb012026');
+    initMap();                      // isolated in its own try/catch
+    loadExcelData('Feb012026');     // has its own try/catch + watchdog
 });
