@@ -1,0 +1,48 @@
+/* 1. DYNAMIC COLOR VARIABLES */
+:root {
+    --bg-color: #f8fafc;
+    --text-main: #1e293b;
+    --text-heading: #0f172a;
+    --card-bg: #ffffff;
+    --border-color: #e2e8f0;
+}
+
+/* 2. BASE STYLES */
+body {
+    background-color: var(--bg-color);
+    color: var(--text-main);
+    font-family: 'Inter', sans-serif;
+    margin: 0;
+    padding: 0; /* Changed from 2rem to allow full-width responsiveness */
+    transition: background-color 0.3s, color 0.3s;
+}
+
+h1, h2, h3 { 
+    color: var(--text-heading); 
+}
+
+/* 3. CRITICAL MAP FIX */
+#map {
+    height: 400px !important; /* Force height */
+    width: 100% !important;
+    border-radius: 16px;
+    border: 1px solid var(--border-color);
+    z-index: 10;
+    background: #e5e7eb; /* Fallback gray while loading */
+}
+
+/* Fix for unrendered tiles in Leaflet */
+.leaflet-container {
+    height: 100% !important;
+    width: 100% !important;
+}
+
+.property-card {
+    background-color: var(--card-bg);
+    border: 1px solid var(--border-color);
+    transition: transform 0.2s ease-in-out;
+}
+
+.property-card:hover {
+    transform: translateY(-4px);
+}
