@@ -1,0 +1,61 @@
+/* ============================================================
+   RURAL EXPLORER — styles.css
+   ============================================================ */
+
+/* 1. THEME VARIABLES */
+:root {
+    --bg-color:      #f8fafc;
+    --text-main:     #1e293b;
+    --text-heading:  #0f172a;
+    --card-bg:       #ffffff;
+    --border-color:  #e2e8f0;
+}
+
+/* 2. BASE */
+body {
+    background-color: var(--bg-color);
+    color:            var(--text-main);
+    font-family:      'Inter', sans-serif;
+    margin:           0;
+    padding:          0;
+    transition:       background-color 0.3s, color 0.3s;
+}
+
+h1, h2, h3 {
+    color: var(--text-heading);
+}
+
+/* 3. MAP — the most critical fix in this file.
+   Leaflet requires an explicit pixel height on its container.
+   Setting both height AND min-height ensures the container
+   never collapses to 0px regardless of flex/grid context.
+   The z-index keeps the map below the sticky header but
+   above normal page flow. */
+#map {
+    height:        450px;
+    min-height:    450px;
+    width:         100%;
+    border-radius: 16px;
+    border:        1px solid var(--border-color);
+    z-index:       10;
+    background:    #cbd5e1; /* slate-300 fallback while tiles load */
+}
+
+/* Leaflet's internal container must match the outer box exactly.
+   Without this the tile grid can render at 0×0 and appear gray. */
+.leaflet-container {
+    height: 100% !important;
+    width:  100% !important;
+}
+
+/* 4. LISTING CARDS */
+.property-card {
+    background-color: var(--card-bg);
+    border:           1px solid var(--border-color);
+    transition:       transform 0.2s ease-in-out, border-color 0.2s;
+}
+
+.property-card:hover {
+    transform:    translateY(-4px);
+    border-color: #10b981; /* emerald-500 */
+}
